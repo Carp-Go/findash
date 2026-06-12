@@ -21,10 +21,12 @@ st.title("FinDash — Global Financial Analytics (prototype)")
 st.caption("Sources: Stooq, FRED (St. Louis Fed), GDELT — free/public tiers, attributed. "
            "Cache TTL 5–15 min.")
 
-INDICES = {
-    "S&P 500": "^spx", "Nasdaq 100": "^ndx", "DAX": "^dax", "FTSE 100": "^ukx",
-    "Nikkei 225": "^nkx", "Shanghai Comp": "^shc", "EUR/USD": "eurusd",
-    "Gold": "xauusd", "Brent": "cb.f", "Bitcoin/USD": "btcusd",
+INDICES = {  # name: (stooq symbol, FRED fallback series or None)
+    "S&P 500": ("^spx", "SP500"), "Nasdaq 100": ("^ndx", "NASDAQ100"),
+    "Dow Jones": ("^dji", "DJIA"), "Nikkei 225": ("^nkx", "NIKKEI225"),
+    "DAX": ("^dax", None), "FTSE 100": ("^ukx", None),
+    "EUR/USD": ("eurusd", "DEXUSEU"), "WTI Crude": ("cl.f", "DCOILWTICO"),
+    "Brent": ("cb.f", "DCOILBRENTEU"), "Bitcoin/USD": ("btcusd", "CBBTCUSD"),
 }
 MACRO = {
     "US 10Y yield": "DGS10", "10Y-2Y curve": "T10Y2Y",
@@ -32,32 +34,49 @@ MACRO = {
 }
 
 
+import time
+
+
+def _fred_csv(series: str) -> pd.DataFrame:
+    for attempt in range(3):
+        try:
+            r = httpx.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
+                          params={"id": series}, headers=UA, timeout=25,
+                          follow_redirects=True)
+            if r.status_code == 200 and r.text.lower().startswith("observation_date"):
+                df = pd.read_csv(io.StringIO(r.text), na_values=".")
+                df.columns = ["date", "value"]
+                df["date"] = pd.to_datetime(df["date"])
+                return df.dropna(subset=["value"])
+        except Exception:
+            pass
+        time.sleep(2 * (attempt + 1))
+    return pd.DataFrame()
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def load_prices(symbol: str) -> pd.DataFrame:
+def load_prices(key: str) -> pd.DataFrame:
+    stooq_sym, fred_id = INDICES[key]
     try:
-        r = httpx.get("https://stooq.com/q/d/l/", params={"s": symbol, "i": "d"},
+        r = httpx.get("https://stooq.com/q/d/l/", params={"s": stooq_sym, "i": "d"},
                       headers=UA, timeout=20, follow_redirects=True)
         df = pd.read_csv(io.StringIO(r.text))
-        if "Close" not in df.columns:
-            return pd.DataFrame()
-        df.columns = [c.lower() for c in df.columns]
-        df["date"] = pd.to_datetime(df["date"])
-        return df
+        if "Close" in df.columns:
+            df.columns = [c.lower() for c in df.columns]
+            df["date"] = pd.to_datetime(df["date"])
+            return df
     except Exception:
-        return pd.DataFrame()
+        pass
+    if fred_id:  # fallback: FRED close-only series
+        f = _fred_csv(fred_id)
+        if not f.empty:
+            return f.rename(columns={"value": "close"})
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_macro(series: str) -> pd.DataFrame:
-    try:
-        r = httpx.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
-                      params={"id": series}, headers=UA, timeout=20, follow_redirects=True)
-        df = pd.read_csv(io.StringIO(r.text), na_values=".")
-        df.columns = ["date", "value"]
-        df["date"] = pd.to_datetime(df["date"])
-        return df.dropna(subset=["value"])
-    except Exception:
-        return pd.DataFrame()
+    return _fred_csv(series)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -91,22 +110,25 @@ tab_mkt, tab_cmp, tab_macro, tab_geo, tab_factor = st.tabs(
 
 with tab_mkt:
     cols = st.columns(5)
-    for i, (name, sym) in enumerate(INDICES.items()):
-        df = load_prices(sym)
+    for i, name in enumerate(INDICES):
+        df = load_prices(name)
         if df.empty or len(df) < 2:
             cols[i % 5].metric(name, "n/a")
             continue
         last, prev = df["close"].iloc[-1], df["close"].iloc[-2]
         cols[i % 5].metric(name, f"{last:,.2f}", f"{(last/prev-1)*100:+.2f}%")
     sel = st.selectbox("Chart", list(INDICES))
-    df = load_prices(INDICES[sel])
+    df = load_prices(sel)
     if not df.empty:
         d = df.tail(250)
-        fig = go.Figure(go.Candlestick(x=d["date"], open=d["open"], high=d["high"],
-                                       low=d["low"], close=d["close"]))
+        if "open" in d.columns:
+            fig = go.Figure(go.Candlestick(x=d["date"], open=d["open"], high=d["high"],
+                                           low=d["low"], close=d["close"]))
+        else:
+            fig = px.line(d, x="date", y="close")
         fig.update_layout(height=420, margin=dict(t=20, b=20))
         st.plotly_chart(fig, use_container_width=True)
-    st.caption("Market data: Stooq (EOD).")
+    st.caption("Market data: Stooq (EOD) with FRED fallback.")
 
 with tab_cmp:
     picks = st.multiselect("Compare (normalized to 100)",
@@ -114,7 +136,7 @@ with tab_cmp:
     lookback = st.slider("Days", 30, 1000, 250)
     series = {}
     for p in picks:
-        d = load_prices(INDICES[p])
+        d = load_prices(p)
         if not d.empty:
             s = d.set_index("date")["close"].tail(lookback)
             series[p] = s / s.iloc[0] * 100
@@ -163,8 +185,8 @@ with tab_factor:
     st.write("Cross-sectional factors across the index universe (proxy demo on "
              "index level; production runs on constituents).")
     panel = {}
-    for name, sym in INDICES.items():
-        d = load_prices(sym)
+    for name in INDICES:
+        d = load_prices(name)
         if not d.empty:
             panel[name] = d.set_index("date")["close"]
     pdf = pd.DataFrame(panel).dropna(how="all").ffill().dropna()
