@@ -36,22 +36,65 @@ MACRO = {
 
 import time
 
+FRED_MARKET_IDS = ("SP500", "NASDAQ100", "DJIA", "NIKKEI225", "DEXUSEU",
+                   "DCOILWTICO", "DCOILBRENTEU", "CBBTCUSD")
+FRED_MACRO_IDS = ("DGS10", "T10Y2Y", "CPIAUCSL", "UNRATE", "VIXCLS")
+
+
+def _fred_key() -> str:
+    try:
+        return st.secrets.get("FRED_API_KEY", "")
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _fred_api_series(series: str) -> pd.DataFrame:
+    """Official FRED API (free key, 120 req/min) — the reliable path."""
+    try:
+        r = httpx.get("https://api.stlouisfed.org/fred/series/observations",
+                      params={"series_id": series, "api_key": _fred_key(),
+                              "file_type": "json", "observation_start": "2015-01-01"},
+                      headers=UA, timeout=25)
+        obs = r.json().get("observations", [])
+        df = pd.DataFrame(obs)
+        if df.empty:
+            return df
+        df = df[["date", "value"]]
+        df["date"] = pd.to_datetime(df["date"])
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        return df.dropna(subset=["value"])
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _fred_table(ids: tuple) -> pd.DataFrame:
+    """Keyless fallback: ONE request for many series."""
+    try:
+        r = httpx.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
+                      params={"id": ",".join(ids)}, headers=UA, timeout=20,
+                      follow_redirects=True)
+        if r.status_code == 200 and r.text.lower().startswith("observation_date"):
+            df = pd.read_csv(io.StringIO(r.text), na_values=".")
+            df = df.rename(columns={df.columns[0]: "date"})
+            df["date"] = pd.to_datetime(df["date"])
+            return df
+    except Exception:
+        pass
+    return pd.DataFrame()
+
 
 def _fred_csv(series: str) -> pd.DataFrame:
-    for attempt in range(3):
-        try:
-            r = httpx.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
-                          params={"id": series}, headers=UA, timeout=25,
-                          follow_redirects=True)
-            if r.status_code == 200 and r.text.lower().startswith("observation_date"):
-                df = pd.read_csv(io.StringIO(r.text), na_values=".")
-                df.columns = ["date", "value"]
-                df["date"] = pd.to_datetime(df["date"])
-                return df.dropna(subset=["value"])
-        except Exception:
-            pass
-        time.sleep(2 * (attempt + 1))
-    return pd.DataFrame()
+    if _fred_key():
+        df = _fred_api_series(series)
+        if not df.empty:
+            return df
+    table = _fred_table(FRED_MARKET_IDS if series in FRED_MARKET_IDS else FRED_MACRO_IDS)
+    if table.empty or series not in table.columns:
+        return pd.DataFrame()
+    out = table[["date", series]].rename(columns={series: "value"})
+    return out.dropna(subset=["value"])
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -59,7 +102,7 @@ def load_prices(key: str) -> pd.DataFrame:
     stooq_sym, fred_id = INDICES[key]
     try:
         r = httpx.get("https://stooq.com/q/d/l/", params={"s": stooq_sym, "i": "d"},
-                      headers=UA, timeout=20, follow_redirects=True)
+                      headers=UA, timeout=6, follow_redirects=True)
         df = pd.read_csv(io.StringIO(r.text))
         if "Close" in df.columns:
             df.columns = [c.lower() for c in df.columns]
