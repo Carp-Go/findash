@@ -175,7 +175,7 @@ with tab_mkt:
 
 with tab_cmp:
     picks = st.multiselect("Compare (normalized to 100)",
-                           list(INDICES), default=["S&P 500", "DAX", "Gold"])
+                           list(INDICES), default=["S&P 500", "DAX", "Bitcoin/USD"])
     lookback = st.slider("Days", 30, 1000, 250)
     series = {}
     for p in picks:
